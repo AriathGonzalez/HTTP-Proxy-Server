@@ -8,24 +8,22 @@ Client Process		Server Proc
 			(<- bytes)
 
 '''
-import sys, os, time, select, queue
+import sys, os, time, select
 from socket import *
-
-# Define cache directory
+        
 CACHE = "cache/"
 
 def fetchFromCache(fileToUse):
-    """Fetches data from cache file."""
     response = b''
     with open(fileToUse, 'rb') as f:
         response += f.read()
     return response
 
 def saveInCache(fileToUse, message):
-    """Saves data to cache file."""
+    f = open(fileToUse, 'w')    # Create file in cache if it does not exist
     with open(fileToUse, 'wb') as f:
         f.write(message)
-        
+
 def extractHostPath(message):
     """Extracts host and path from HTTP request."""
     firstLine = message.split("\n")[0]
@@ -46,105 +44,86 @@ def startProxyServer():
     tcpSerSock.listen(100)
     
     inputs = {tcpSerSock}
-    outputs = set()
-    messageQueues = {}
-
-    print('Ready to serve...')
+    print("Ready to serve...")
     while inputs:
-        readable, writable, exceptional = select.select(inputs, outputs, inputs)
+        readable, _, exceptional = select.select(inputs, [], inputs)
         for s in readable:
             if s is tcpSerSock:
-                # 1) The client sends an HTTP request to retrieve an object
+                # Client connects to welcoming socket, Proxy intercepts and reads
+                # 1) tcp socket reading from client
                 tcpCliSock, addr = s.accept()   
                 tcpCliSock.setblocking(0)
                 print('Received a connection from:', addr)
 
                 # Add new client socket to list of sockets to monitor
                 inputs.add(tcpCliSock)
-                messageQueues[tcpCliSock] = queue.Queue()
             else:
-                if s not in messageQueues:
-                    messageQueues[s] = queue.Queue()
+                try:
+                    # Client sends HTTP request, Proxy intercepts and reads
+                    # 2) proxy reads from client
+                    message = s.recv(1024)
 
-				# (2) This request gets received by the proxy and it creates a 
-                # fresh HTTP request for the same object to the origin server
-                message = s.recv(1024).decode()
+                    if message:
+                        print(message)
+                        host, path = extractHostPath(message.decode())
 
-                if message:
-                    print(message)
-                    messageQueues[s].put(message)
-                    if s not in outputs:
-                        outputs.add(s)
-                else:
-                    if s in outputs:
-                        outputs.remove(s)
-                    inputs.remove(s)
-                    s.close()
-                    del messageQueues[s]
-                    
-        for s in writable:
-            try:
-                nextMsg = messageQueues[s].get_nowait()
-            except queue.Empty:
-                outputs.remove(s)
-            else:
-                host, path = extractHostPath(nextMsg)
-                fileToUse = CACHE + host[1:]
-                
-                # Check whether the file exists in the cache
-                if os.path.exists(fileToUse):
-                    fileModifiedTime = os.path.getmtime(fileToUse)
-                    currTime = time.time()
-                    age = currTime - fileModifiedTime
-                    
-                    print("File age: ", age)
-                    if age > MAX_AGE:
-                        os.remove(fileToUse)    # Discard from cache
+                        fileToUse = CACHE + host[1:]
+
+                        # Check whether the file exists in the cache
+                        if os.path.exists(fileToUse):
+                            fileModifiedTime = os.path.getmtime(fileToUse)
+                            currTime = time.time()
+                            age = currTime - fileModifiedTime
+                            print("File age: ", age)
+
+                            if age > MAX_AGE:
+                                os.remove(fileToUse)    # Discard from cache
+                            else:
+                                # Proxy server finds a cache hit and generates a response message
+                                print("Fetching ", host[1: ], " from cache...")
+                                response = fetchFromCache(fileToUse)
+                                s.sendall(response)
+                                continue
+
+                        else:
+                            print("Fetching ", host[1: ], " from origin server...")
+
+                            # Proxy sends request on behalf of client to web server
+                            # 3) proxy sends to webserver
+                            request = f"GET /{path} HTTP/1.1\r\nHost:{host[1:]}\r\nConnection: close\r\n\r\n"
+                            destSocket = socket(AF_INET, SOCK_STREAM)
+                            destSocket.connect((host[1:], 80))
+                            destSocket.sendall(request.encode())
+
+                            # Webserver sends response to client, Proxy intercepts and reads
+                            # 4) proxy reads from webserver
+                            response = b''
+                            while True:
+                                # (4) Webserver sends the response back to the Proxy Server
+                                chunk = destSocket.recv(4096)
+
+                                # No more data to send
+                                if not chunk:
+                                    break
+                                response += chunk
+                            
+                            saveInCache(fileToUse, response)
+                            destSocket.close()
+                            # Proxy sends response to client on behalf of webserver
+                            # 5) proxy sends to client
+                            s.sendall(response)
                     else:
-                        # Proxy server finds a cache hit and generates a response message
-                        print("Fetching ", fileToUse, " from cache...")
-                        response = fetchFromCache(fileToUse)
-                        s.sendall(response)
-                        continue
-                    
-                print("Fetching ", fileToUse, " from origin server...")
-
-				# (3) Send the new HTTP request to the Web Server
-                destSocket = socket(AF_INET, SOCK_STREAM)
-                destSocket.connect((host[1:], 80))
-
-                request = f"GET /{path} HTTP/1.1\r\nHost:{host[1:]}\r\nConnection: close\r\n\r\n"
-                destSocket.sendall(request.encode())
-
-                response = b''
-                while True:
-                    # (4) Webserver sends the response back to the Proxy Server
-                    chunk = destSocket.recv(4096)
-
-                    # No more data to send
-                    if len(chunk) == 0:
-                        break
-                    response += chunk
-                
-                # Must modify page to prevent favicon requests.
-                response = response.replace(b'</title>', b'</title>\n<link rel="icon" href="data:," />')
-
-                saveInCache(fileToUse, response)
-                destSocket.close()
-
-				# (5) The proxy server creates a new HTTP response along with the object 
-				# and sends back to the client
-                s.sendall(response)
-                
+                        inputs.remove(s)
+                        s.close()
+                except OSError as e:
+                    print(f"Error {e} with socket: {s}")
+                    inputs.remove(s)
+                    s.close()  
         for s in exceptional:
             inputs.remove(s)
-            if s in outputs:
-                outputs.remove(s)
             s.close()
-            del messageQueues[s]
 
     tcpSerSock.close()
-
 if __name__ == "__main__":
     if len(sys.argv) <= 2:
         print('Usage : "python ProxyServer.py server_ip max_age"\n[server_ip : It is the IP Address Of Proxy Server]\n[max_age: It is the max age (in seconds) for an item in the cache.]')
